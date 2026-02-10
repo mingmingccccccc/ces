@@ -1,0 +1,1719 @@
+我看到了！这是一份详细的技术问题排查记录。让我总结一下当前的情况：
+
+当前状态总结
+问题：WooCommerce 产品页面 (/product/xxx/) 返回 404，而且总是被 Next.js 处理，不是 WordPress
+
+已排查过的：
+
+✅ Nginx 配置文件已正确修改（location ^~ /product/ 存在）
+✅ Nginx 已重载多次
+✅ 没有 WAF 防火墙干扰
+✅ 只有一个 server 块
+❌ 但请求仍被 Next.js 处理（返回头里没有 X-Handled-By: wordpress-php）
+关键发现：
+
+Nginx 配置中有 lua_package_path 和 set_by_lua_block 代码在处理 /.well-known/ 请求
+宝塔面板在 Nginx 中加载了 WAF 相关配置（/www/server/panel/vhost/nginx/waf2monitor_data.conf）
+你之前停掉了 Next.js 进程，但没有继续测试
+下一步排查
+让我们继续完成之前中断的测试。请执行：
+
+继续测试.sh
+# 1. 确认 Next.js 已停止
+ps aux | grep "next" | grep -v grep
+
+# 2. 停止状态下，直接访问 /product/l8700/
+curl -sS -D - -o /dev/null \
+  --resolve "topten-safety.com:443:154.9.255.250" \
+把这些结果贴给我，尤其是 Step 2 的结果——如果 Next.js 停止后，请求返回的不再是 Next.js 404，那说明请求确实被 Nginx 拦截了，问题在于 Nginx 和 PHP-FPM 的通信。
+
+如果仍然返回 Next.js 的 404，那就说明有其他 Nginx 进程或代理在处理这个请求。
+
+继续测试.sh
+L17
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# ps aux | grep "next" |
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# ps aux | grep "next" | grep -v grep
+root      237786  0.0  1.1 11817020 91332 ?      Sl   16:33   0:01 next-server (
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null \
+>   --resolve "topten-safety.com:443:154.9.255.250" \
+>   "https://topten-safety.com/product/l8700/" 2>&1
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 08:59:45 GMT
+content-type: text/html; charset=utf-8
+content-length: 14523
+vary: Accept-Encoding
+cache-control: private, no-cache, no-store, max-age=0, must-revalidate
+vary: rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch, Accept-Encoding
+x-nextjs-cache: HIT
+x-nextjs-prerender: 1
+x-nextjs-prerender: 1
+x-nextjs-stale-time: 300
+x-powered-by: Next.js
+etag: "d43zt9e8f3b6q"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# tail -10 /www/wwwlogs/topten-safety.com.error.log
+2026/02/10 14:59:44 [error] 7532#0: *407 connect() failed (111: Connection refused) while connecting to upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /about HTTP/2.0", upstream: "http://127.0.0.1:3000/about", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-admin/edit.php?post_type=page"
+2026/02/10 14:59:44 [error] 7532#0: *407 connect() failed (111: Connection refused) while connecting to upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /favicon.ico HTTP/2.0", upstream: "http://127.0.0.1:3000/favicon.ico", host: "topten-safety.com", referrer: "https://topten-safety.com/about"
+2026/02/10 15:01:43 [error] 7532#0: *417 connect() failed (111: Connection refused) while connecting to upstream, client: 154.9.255.250, server: topten-safety.com, request: "POST /wp-cron.php?doing_wp_cron=1770706903.0865070819854736328125 HTTP/1.1", upstream: "http://127.0.0.1:3000/wp-cron.php?doing_wp_cron=1770706903.0865070819854736328125", host: "topten-safety.com"
+2026/02/10 15:52:12 [error] 151507#0: *1305 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/tags-box.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/tags-box.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-admin/post.php?post=639&action=edit"
+2026/02/10 15:52:12 [error] 151507#0: *1305 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/word-count.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/word-count.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-admin/post.php?post=639&action=edit"
+2026/02/10 15:52:12 [error] 151507#0: *1305 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/editor-expand.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/editor-expand.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-admin/post.php?post=639&action=edit"
+2026/02/10 15:52:12 [error] 151507#0: *1305 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/post.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/post.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-admin/post.php?post=639&action=edit"
+2026/02/10 16:31:49 [error] 226654#0: *1738 connect() failed (111: Connection refused) while connecting to upstream, client: 154.9.255.250, server: topten-safety.com, request: "POST /wp-cron.php?doing_wp_cron=1770712309.0931019783020019531250 HTTP/1.1", upstream: "http://127.0.0.1:3000/wp-cron.php?doing_wp_cron=1770712309.0931019783020019531250", host: "topten-safety.com"
+2026/02/10 16:33:19 [error] 226654#0: *1741 connect() failed (111: Connection refused) while connecting to upstream, client: 154.9.255.250, server: topten-safety.com, request: "GET /product/l8700/ HTTP/2.0", upstream: "http://127.0.0.1:3000/404.html", host: "topten-safety.com"
+2026/02/10 16:33:20 [error] 226654#0: *1744 connect() failed (111: Connection refused) while connecting to upstream, client: 154.9.255.250, server: topten-safety.com, request: "POST /wp-cron.php?doing_wp_cron=1770712399.8293070793151855468750 HTTP/1.1", upstream: "http://127.0.0.1:3000/wp-cron.php?doing_wp_cron=1770712399.8293070793151855468750", host: "topten-safety.com"
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# pm2 start topten-safety.com || pm2 resurrect
+[PM2][ERROR] Script not found: /www/wwwroot/topten-safety.com/topten-safety.com
+[PM2] Resurrecting
+[PM2] Restoring processes located in /root/.pm2/dump.pm2
+┌────┬────────────────────┬──────────┬──────┬───────────┬──────────┬──────────┐
+│ id │ name               │ mode     │ ↺    │ status    │ cpu      │ memory   │
+├────┼────────────────────┼──────────┼──────┼───────────┼──────────┼──────────┤
+│ 0  │ topten-safety.com  │ fork     │ 0    │ online    │ 0%       │ 67.9mb   │
+└────┴────────────────────┴──────────┴──────┴───────────┴──────────┴──────────┘
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# sleep 3
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# pm2 list
+┌────┬────────────────────┬──────────┬──────┬───────────┬──────────┬──────────┐
+│ id │ name               │ mode     │ ↺    │ status    │ cpu      │ memory   │
+├────┼────────────────────┼──────────┼──────┼───────────┼──────────┼──────────┤
+│ 0  │ topten-safety.com  │ fork     │ 0    │ online    │ 0%       │ 67.9mb   │
+└────┴────────────────────┴──────────┴──────┴───────────┴──────────┴──────────┘
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# 
+planning response
+
+Copilot said: 好！我找到了**真正的问题所在**！看错误日志的这一行： ``` 2026/02/10 16:33:19 [error] 226654#0: *1741 connect() failed
+好！我找到了真正的问题所在！看错误日志的这一行：
+
+Code
+2026/02/10 16:33:19 [error] 226654#0: *1741 connect() failed (111: Connection refused) 
+while connecting to upstream, client: 154.9.255.250, server: topten-safety.com, 
+request: "GET /product/l8700/ HTTP/2.0", upstream: "http://127.0.0.1:3000/404.html", 
+host: "topten-safety.com"
+关键信息：upstream: "http://127.0.0.1:3000/404.html"
+
+这说明 Nginx 已经正确拦截了 /product/l8700/ 请求，但是：
+
+WordPress/PHP 处理后返回了 404 状态码
+Nginx 的 error_page 404 /404.html; 规则被触发
+Nginx 尝试访问 /404.html，但这个文件在网站根目录 /www/wwwroot/topten-safety.com/ 下不存在或不是静态文件
+所以 Nginx 把请求转给了 Next.js（proxy_pass http://127.0.0.1:3000/404.html）
+Next.js 返回了缓存的 404 页面
+真正的根本问题
+WordPress 自己返回了 404，而不是 Nginx 配置问题！
+
+这可能是以下原因之一：
+
+WordPress 没有正确识别 /product/l8700/ 路由（WooCommerce 路由注册失败）
+PHP 传递给 WordPress 的参数不完整（REQUEST_URI、SCRIPT_NAME 等）
+产品 "l8700" 不存在或已删除
+解决方案
+让我们分两步：
+
+第一步：确认产品确实存在
+检查产品.sh
+v1
+# 1. 连接 WordPress 数据库，查询产品
+mysql -u root -p'你的数据库密码' -e "
+USE wp_database_name;  # 替换成你的 WP 数据库名
+SELECT ID, post_title, post_name, post_type, post_status 
+FROM wp_posts 
+WHERE post_type = 'product' AND post_name = 'l8700' 
+先执行这个，把结果贴给我。确认产品真的存在。
+
+第二步：修复 error_page 404 问题
+问题根源：error_page 404 /404.html; 规则会把所有 404 转给 Next.js。
+
+修改主配置文件，取消或注释掉 error_page 404 规则：
+
+Jovianlimu / ces / %E5%AF%B9%E8%AF%9D.md
+# 主配置文件：/www/server/panel/vhost/nginx/topten-safety.com.conf
+
+# 找到这一行：
+# error_page 404 /404.html;
+
+# 改为注释掉：
+或者更精确的做法：只让 Next.js 的 404 页面使用这个规则，WordPress 的 404 直接返回：
+
+更精确的方案
+# 改成这样：
+location ~ ^/404\.html$ {
+    # 允许访问 404.html 文件
+    root /www/wwwroot/topten-safety.com;
+}
+
+请先执行产品检查命令，然后试试注释掉 error_page 404 这一行。再测试一次。把结果贴给我。
+
+Make these code changes?
+/www/server/panel/vhost/nginx/proxy/topten-safety.com/proxy.conf
+
+conf
+location ^~ /product/ {
+    try_files $uri $uri/ @woo_fallback;
+}
+
+location @woo_fallback {
+    # Add your fallback handling logic here
+    # For example, proxy to the appropriate FastCGI backend
+    include fastcgi_params;
+    fastcgi_pass 127.0.0.1:9000;  # Update to your actual FastCGI backend
+}
+Please confirm you want Copilot to make this change in the Jovianlimu/topten-safety repository on branch main.
+
+You said: 这个是对的还是错的：mysql -u root -p'ewd7zt4xszHfcfPb' -e " USE wp_database_name;
+这个是对的还是错的：mysql -u root -p'ewd7zt4xszHfcfPb' -e "
+USE wp_database_name;  # 替换成你的 WP 数据库名
+SELECT ID, post_title, post_name, post_type, post_status
+FROM wp_posts
+WHERE post_type = 'product' AND post_name = 'l8700'
+LIMIT 1;
+"
+Copilot said: 那个命令**有一个错误**。 问题在这里： ```bash USE wp_database_name; # 替换成你的 WP 数据库名 ``` 你需要把
+那个命令有一个错误。
+
+问题在这里：
+
+bash
+USE wp_database_name;  # 替换成你的 WP 数据库名
+你需要把 wp_database_name 替换成你实际的 WordPress 数据库名称。
+
+正确的命令应该是：
+
+检查产品.sh
+v2
+# 先找出你的 WP 数据库名称
+cat /www/wwwroot/topten-safety.com/blog/wp-config.php | grep "DB_NAME"
+
+# 然后用实际的数据库名替换，比如：
+mysql -u root -p'ewd7zt4xszHfcfPb' -e "
+SELECT ID, post_title, post_name, post_type, post_status 
+或者更简单的做法，先查出数据库名：
+
+查数据库名.sh
+# 1. 查看 WordPress 配置文件中的数据库名
+grep "DB_NAME" /www/wwwroot/topten-safety.com/blog/wp-config.php
+
+# 2. 然后把输出的数据库名复制到这里执行
+mysql -u root -p'ewd7zt4xszHfcfPb' 你的数据库名 -e "
+SELECT ID, post_title, post_name, post_type, post_status 
+请先执行第一个命令查出数据库名，然后贴结果给我。
+
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u root -p'ewd7zt4xszHfcfPb' -e "
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u root -p'ewd7zt4xszHfcfPb' -e " topten_safety_co; SELECT ID, post_title, post_name, post_type, post_status FROM wp_posts WHERE post_type = 'product' AND post_name = 'l8700' LIMIT 1; "
+mysql: [Warning] Using a password on the command line interface can be insecure.
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+现在对不对
+Copilot said: 不对，有两个问题： 1. **数据库名写错了**：`topten_safety_co` 应该是 `topten_safety_com` 吗？ 2. **密码可能错了**：无法连接到 MySQL 让我们先确认正确的数据库名和凭证： ```bash
+不对，有两个问题：
+
+数据库名写错了：topten_safety_co 应该是 topten_safety_com 吗？
+密码可能错了：无法连接到 MySQL
+让我们先确认正确的数据库名和凭证：
+
+确认数据库信息.sh
+# 1. 查看 WordPress 配置文件里的真实数据库信息
+grep -E "DB_NAME|DB_USER|DB_PASSWORD" /www/wwwroot/topten-safety.com/blog/wp-config.php
+
+执行这个命令，把输出贴给我。这样我们就能看到正确的：
+
+数据库名
+数据库用户名
+数据库密码
+然后用正确的凭证执行查询。
+
+You said: topten_safety_co 这个就是数据库名字
+topten_safety_co 这个就是数据库名字
+Copilot said: 那是**密码错了**。用 WordPress 配置文件里的数据库用户名和密码来连接： ```bash name=获取数据库凭证.sh # 查看 WordPress 配置文件里的数据库连接信息 grep
+那是密码错了。用 WordPress 配置文件里的数据库用户名和密码来连接：
+
+获取数据库凭证.sh
+# 查看 WordPress 配置文件里的数据库连接信息
+grep -E "DB_NAME|DB_USER|DB_PASSWORD" /www/wwwroot/topten-safety.com/blog/wp-config.php
+
+执行这个命令，把输出贴给我。我们用 WordPress 自己的数据库用户来连接，而不是 root。
+
+You said: ewd7zt4xszHfcfPb 这个就是密码
+ewd7zt4xszHfcfPb 这个就是密码
+Copilot said: 那问题是 **MySQL 的 root 用户密码不是这个**。这个密码是 WordPress 数据库用户的密码，不一定是
+那问题是 MySQL 的 root 用户密码不是这个。这个密码是 WordPress 数据库用户的密码，不一定是 root 的。
+
+让我们用 WordPress 配置文件里的用户名来连接：
+
+查看WP数据库用户.sh
+# 查看 WordPress 用的数据库用户名是什么
+grep "DB_USER" /www/wwwroot/topten-safety.com/blog/wp-config.php
+
+执行这个，贴结果给我。然后我们用正确的用户名连接：
+
+连接数据库.sh
+# 把 WP用户名 替换成上面查到的用户名
+mysql -u WP用户名 -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT ID, post_title, post_name, post_type, post_status 
+FROM wp_posts 
+WHERE post_type = 'product' AND post_name = 'l8700' 
+LIMIT 1;
+You said: topten_safety_co 这是用户名
+topten_safety_co 这是用户名
+Copilot said: 好，那完整命令是： ```bash name=查询产品.sh mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+好，那完整命令是：
+
+查询产品.sh
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT ID, post_title, post_name, post_type, post_status 
+FROM wp_posts 
+WHERE post_type = 'product' AND post_name = 'l8700' 
+LIMIT 1;
+"
+执行这个，把结果贴给我。我们需要确认产品 l8700 是否存在并且状态是 publish。
+
+检查产品.sh
+L1-L11
+You said: 好的我们继续！mysql: [Warning] Using a password on the
+好的我们继续！mysql: [Warning] Using a password on the command line interface can be insecure.
++-----+------------+-----------+-----------+-------------+
+| ID  | post_title | post_name | post_type | post_status |
++-----+------------+-----------+-----------+-------------+
+| 639 | L8700      | l8700     | product   | publish     |
++-----+------------+-----------+-----------+-------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# 
+Copilot said: 产品 `l8700`（ID: 639）**确实存在且状态是 publish**。所以问题不是产品不存在。 问题确认回顾：**WordPress/PHP 处理了请求但返回了 404**，然后 `error_page
+产品 l8700（ID: 639）确实存在且状态是 publish。所以问题不是产品不存在。
+
+问题确认回顾：WordPress/PHP 处理了请求但返回了 404，然后 error_page 404 /404.html; 把它转给了 Next.js。
+
+现在需要解决两个问题：
+
+第一步：阻止 error_page 把 WordPress 的 404 转给 Next.js
+修复error_page.sh
+# 在主配置文件中注释掉 error_page 404
+sed -i 's/^    error_page 404 \/404.html;/    #error_page 404 \/404.html;/' /www/server/panel/vhost/nginx/topten-safety.com.conf
+
+# 确认修改成功
+grep "error_page 404" /www/server/panel/vhost/nginx/topten-safety.com.conf
+
+第二步：检查 WordPress 的固定链接设置
+检查WP设置.sh
+# 查看 WordPress 的固定链接和 WooCommerce 的固定链接设置
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_name, option_value 
+FROM wp_posts AS p 
+RIGHT JOIN wp_options AS o ON 1=1
+WHERE o.option_name IN ('permalink_structure', 'woocommerce_permalinks', 'siteurl', 'home', 'rewrite_rules')
+不对，简化一下：
+
+检查WP设置v2.sh
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_name, option_value 
+FROM wp_options 
+WHERE option_name IN ('permalink_structure', 'woocommerce_permalinks', 'siteurl', 'home');
+"
+
+第三步：重载 Nginx 并测试
+重载测试.sh
+nginx -t && nginx -s reload
+sleep 2
+curl -sS -D - -o /dev/null \
+  --resolve "topten-safety.com:443:154.9.255.250" \
+  "https://topten-safety.com/product/l8700/"
+
+请依次执行这三步，把所有结果贴给我。第二步的 WordPress 设置信息最关键——我需要看 permalink_structure 和 woocommerce_permalinks 到底设置成了什么。
+
+重载测试.sh
+L1-L5
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# sed -i 's/^
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# sed -i 's/^    error_page 404 \/404.html;/    #error_page 404 \/404.html;/' /www/server/panel/vhost/nginx/topten-safety.com.conf
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# grep "error_page 404" /www/server/panel/vhost/nginx/topten-safety.com.conf
+    #error_page 404/404.html;
+    #error_page 404 /404.html;
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_name, option_value 
+> FROM wp_options 
+> WHERE option_name IN ('permalink_structure', 'woocommerce_permalinks', 'siteurl', 'home');
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| option_name            | option_value                                                                                                                                                                   |
++------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| home                   | http://topten-safety.com                                                                                                                                                       |
+| permalink_structure    | /index.php/%postname%/                                                                                                                                                         |
+| siteurl                | http://topten-safety.com                                                                                                                                                       |
+| woocommerce_permalinks | a:5:{s:12:"product_base";s:8:"/product";s:13:"category_base";s:8:"products";s:8:"tag_base";s:11:"product-tag";s:14:"attribute_base";s:0:"";s:22:"use_verbose_page_rules";b:0;} |
++------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# nginx -t && nginx -s reload
+nginx: the configuration file /www/server/nginx/conf/nginx.conf syntax is ok
+nginx: configuration file /www/server/nginx/conf/nginx.conf test is successful
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# sleep 2
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null \
+>   --resolve "topten-safety.com:443:154.9.255.250" \
+>   "https://topten-safety.com/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:07:29 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+x-handled-by: wordpress-php
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# 
+Copilot said: 巨大的进展！看到了吗： ``` x-handled-by: wordpress-php ``` **请求终于进入了 WordPress！** 但 WordPress 自己返回了 404。 现在看到了问题的真正根源。看
+巨大的进展！看到了吗：
+
+Code
+x-handled-by: wordpress-php
+请求终于进入了 WordPress！ 但 WordPress 自己返回了 404。
+
+现在看到了问题的真正根源。看 WordPress 的设置：
+
+permalink_structure = /index.php/%postname%/
+woocommerce_permalinks → product_base = /product
+矛盾在这里：WordPress 的文章固定链接用了 /index.php/ 前缀，但 WooCommerce 的产品基准是 /product（没有 /index.php/ 前缀）。WordPress 内部路由期望产品页面走 /index.php/product/l8700/，但你的 Nginx 直接把 /product/l8700/ 发给了 PHP，WordPress 不认识这个路径。
+
+解决方案：修改 WooCommerce 的 product_base 加上 index.php
+修复WooCommerce固定链接.sh
+# 把 product_base 从 /product 改成 /index.php/product
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+UPDATE wp_options 
+SET option_value = 'a:5:{s:12:\"product_base\";s:18:\"/index.php/product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+WHERE option_name = 'woocommerce_permalinks';
+"
+然后刷新 WordPress 的 rewrite rules
+刷新rewrite.sh
+# 清除 rewrite rules，让 WordPress 下次访问时自动重建
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+DELETE FROM wp_options WHERE option_name = 'rewrite_rules';
+"
+
+然后修改 Nginx，让 /product/ 走 /index.php 路由
+因为现在产品链接变成了 /index.php/product/l8700/，你已有的 location ^~ /index.php 就能处理了。所以 /product/ 的 location 块可以改为重写到 /index.php：
+
+修改Nginx产品块.sh
+# 修改反向代理配置，把 /product/ 重写到 /index.php
+cat > /tmp/product_fix.py << 'EOF'
+import re
+filepath = '/www/server/panel/vhost/nginx/proxy/topten-safety.com/7b072079e9ca0cc2a413dbe40fef68bb_topten-safety.com.conf'
+with open(filepath, 'r') as f:
+    content = f.read()
+最后测试
+最终测试.sh
+v1
+sleep 2
+curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+
+请依次执行这四步，把结果贴给我。核心思路：让产品页面也走 /index.php/product/l8700/ 路径，和文章一样通过 location ^~ /index.php 处理。
+
+You said: 我先把反向代理代码给你和配置文件给你： 反向代理代码：#PROXY-START/ # ==================== 1. WordPress 核心 ==================== location ~
+我先把反向代理代码给你和配置文件给你：
+反向代理代码：#PROXY-START/
+
+# ==================== 1. WordPress 核心 ====================
+location ~ ^/(wp-admin|wp-login\.php|wp-json|xmlrpc\.php) {
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+location ~ ^/(wp-content|wp-includes) {
+    root /www/wwwroot/topten-safety.com/blog;
+    expires 30d;
+}
+
+# ==================== 2. 文章页 (index.php) ====================
+location ^~ /index.php {
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_split_path_info ^(.+\.php)(/.+)$;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_param PATH_INFO $fastcgi_path_info;
+    include fastcgi_params;
+}
+
+# ==================== 3. WooCommerce 产品页修复 ====================
+location ^~ /product/ {
+    add_header X-Handled-By "wordpress-php" always;
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    include fastcgi_params;
+
+    fastcgi_param SCRIPT_FILENAME /www/wwwroot/topten-safety.com/blog/index.php;
+    fastcgi_param SCRIPT_NAME /index.php;
+    fastcgi_param REQUEST_URI $request_uri;
+    fastcgi_param QUERY_STRING $query_string;
+    fastcgi_param DOCUMENT_ROOT /www/wwwroot/topten-safety.com/blog;
+}
+
+# ==================== 4. WooCommerce 其他页面 ====================
+# 需要哪个就取消注释哪个
+
+# location ^~ /cart/ {
+#     root /www/wwwroot/topten-safety.com/blog;
+#     fastcgi_pass unix:/tmp/php-cgi-80.sock;
+#     include fastcgi_params;
+#     fastcgi_param SCRIPT_FILENAME /www/wwwroot/topten-safety.com/blog/index.php;
+#     fastcgi_param SCRIPT_NAME /index.php;
+#     fastcgi_param REQUEST_URI $request_uri;
+#     fastcgi_param QUERY_STRING $query_string;
+#     fastcgi_param DOCUMENT_ROOT /www/wwwroot/topten-safety.com/blog;
+# }
+
+# location ^~ /checkout/ {
+#     root /www/wwwroot/topten-safety.com/blog;
+#     fastcgi_pass unix:/tmp/php-cgi-80.sock;
+#     include fastcgi_params;
+#     fastcgi_param SCRIPT_FILENAME /www/wwwroot/topten-safety.com/blog/index.php;
+#     fastcgi_param SCRIPT_NAME /index.php;
+#     fastcgi_param REQUEST_URI $request_uri;
+#     fastcgi_param QUERY_STRING $query_string;
+#     fastcgi_param DOCUMENT_ROOT /www/wwwroot/topten-safety.com/blog;
+# }
+
+# location ^~ /my-account/ {
+#     root /www/wwwroot/topten-safety.com/blog;
+#     fastcgi_pass unix:/tmp/php-cgi-80.sock;
+#     include fastcgi_params;
+#     fastcgi_param SCRIPT_FILENAME /www/wwwroot/topten-safety.com/blog/index.php;
+#     fastcgi_param SCRIPT_NAME /index.php;
+#     fastcgi_param REQUEST_URI $request_uri;
+#     fastcgi_param QUERY_STRING $query_string;
+#     fastcgi_param DOCUMENT_ROOT /www/wwwroot/topten-safety.com/blog;
+# }
+
+# ==================== 5. Next.js 兜底 ====================
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header REMOTE-HOST $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_http_version 1.1;
+
+    if ( $uri ~* "\.(gif|png|jpg|css|js|woff|woff2)$" ) {
+        expires 1m;
+    }
+}
+
+#PROXY-END/
+
+配置文件代码：server
+{
+    listen 80;
+    listen 443 ssl ;
+    http2 on;
+    server_name topten-safety.com www.topten-safety.com;
+    index index.php index.html index.htm default.php default.htm default.html;
+    root /www/wwwroot/topten-safety.com;
+    include /www/server/panel/vhost/nginx/extension/topten-safety.com/*.conf;
+
+    #CERT-APPLY-CHECK--START
+    # 用于SSL证书申请时的文件验证相关配置 -- 请勿删除
+    include /www/server/panel/vhost/nginx/well-known/topten-safety.com.conf;
+    #CERT-APPLY-CHECK--END
+
+    #SSL-START SSL相关配置，请勿删除或修改下一行带注释的404规则
+    #error_page 404/404.html;
+    #HTTP_TO_HTTPS_START
+    if ($server_port !~ 443){
+        rewrite ^(/.*)$ https://$host$1 permanent;
+    }
+    #HTTP_TO_HTTPS_END
+    ssl_certificate    /www/server/panel/vhost/cert/topten-safety.com/fullchain.pem;
+    ssl_certificate_key    /www/server/panel/vhost/cert/topten-safety.com/privkey.pem;
+    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
+    ssl_ciphers EECDH+CHACHA20:EECDH+CHACHA20-draft:EECDH+AES128:RSA+AES128:EECDH+AES256:RSA+AES256:EECDH+3DES:RSA+3DES:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_tickets on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    add_header Strict-Transport-Security "max-age=31536000";
+    error_page 497  https://$host$request_uri;
+    #SSL-END
+
+    #ERROR-PAGE-START  错误页配置
+    #error_page 404 /404.html;
+    #ERROR-PAGE-END
+
+    #PHP-INFO-START  PHP引用配置
+    location ~ /purge(/.*) {
+        proxy_cache_purge cache_one $host$1$is_args$args;
+    }
+
+    # 引用反向代理文件
+    include /www/server/panel/vhost/nginx/proxy/topten-safety.com/*.conf;
+
+    include enable-php-00.conf;
+    #PHP-INFO-END
+
+    #REWRITE-START URL重写规则引用
+    include /www/server/panel/vhost/rewrite/topten-safety.com.conf;
+    #REWRITE-END
+
+    #禁止访问的文件或目录
+    location ~ ^/(\.user.ini|\.htaccess|\.git|\.env|\.svn|\.project|LICENSE|README.md)
+    {
+        return 404;
+    }
+
+    location ~ \.well-known{
+        allow all;
+    }
+
+    access_log  /www/wwwlogs/topten-safety.com.log;
+    error_log  /www/wwwlogs/topten-safety.com.error.log;
+}
+Copilot said: 好，现在我已经看到了你当前完整的配置。 根据我们之前的发现，**核心问题是**：WordPress 的固定链接用了 `/index.php/%postname%/`，但 WooCommerce 的产品基准是 `/product`（没有 `/index.php/`
+好，现在我已经看到了你当前完整的配置。
+
+根据我们之前的发现，核心问题是：WordPress 的固定链接用了 /index.php/%postname%/，但 WooCommerce 的产品基准是 /product（没有 /index.php/ 前缀），所以 WordPress 内部路由无法识别 /product/l8700/。
+
+最简单的方案：让 Nginx 把 /product/ 请求重写到 /index.php/product/，这样就能走已经正常工作的 location ^~ /index.php 规则。
+
+你只需要修改反向代理配置文件
+用以下内容完整替换：
+
+反向代理配置文件（完整替换）
+#PROXY-START/
+
+# ==================== 1. WordPress 核心 ====================
+location ~ ^/(wp-admin|wp-login\.php|wp-json|xmlrpc\.php) {
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+主配置文件不需要改动（保持你现在的就行）。
+
+然后执行：
+替换后执行.sh
+# 1. 测试 Nginx 配置
+nginx -t
+
+# 2. 重载
+nginx -s reload
+
+把结果贴给我。这次的原理是：/product/l8700/ → 重写为 /index.php/product/l8700/ → 进入已经正常工作的 location ^~ /index.php 块 → WordPress 通过 PATH_INFO 解析出产品。
+
+替换后执行.sh
+L9
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null "https://topten-safety.com/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:12:06 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com#
+Copilot said: 好消息：请求已经进入 WordPress 了（没有 `x-powered-by: Next.js`，有 `wp-json` 链接）。但
+好消息：请求已经进入 WordPress 了（没有 x-powered-by: Next.js，有 wp-json 链接）。但 WordPress 自己返回 404。
+
+这说明 WordPress 内部路由不认识 /index.php/product/l8700/ 这个路径。问题在于 WooCommerce 的 product_base 设置是 /product，而不是 /index.php/product。
+
+现在执行之前提到的数据库修复，让 WooCommerce 刷新路由：
+
+修复WooCommerce路由.sh
+# 1. 查看当前 WooCommerce 固定链接设置
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_value FROM wp_options WHERE option_name = 'woocommerce_permalinks';
+"
+
+# 2. 把 product_base 从 /product 改成 /index.php/product
+把所有结果贴给我。第 5 步最关键——如果 /index.php/product/l8700/ 能返回 200，那问题就彻底解决了。
+
+修复WooCommerce路由.sh
+L24
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_value FROM wp_options WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| option_value                                                                                                                                                                              |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| a:5:{s:12:"product_base";s:18:"/index.php/product";s:13:"category_base";s:8:"products";s:8:"tag_base";s:11:"product-tag";s:14:"attribute_base";s:0:"";s:22:"use_verbose_page_rules";b:0;} |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> UPDATE wp_options 
+> SET option_value = 'a:5:{s:12:\"product_base\";s:18:\"/index.php/product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+> WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> DELETE FROM wp_options WHERE option_name = 'rewrite_rules';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_value FROM wp_options WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| option_value                                                                                                                                                                              |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| a:5:{s:12:"product_base";s:18:"/index.php/product";s:13:"category_base";s:8:"products";s:8:"tag_base";s:11:"product-tag";s:14:"attribute_base";s:0:"";s:22:"use_verbose_page_rules";b:0;} |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:13:25 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# 
+Copilot said: WordPress 还是返回 404。数据库设置已经正确了，但 WordPress 需要重新生成 rewrite rules。 问题可能是
+WordPress 还是返回 404。数据库设置已经正确了，但 WordPress 需要重新生成 rewrite rules。
+
+问题可能是 WordPress 的 siteurl 和 home 设置为 http://topten-safety.com（不含 /blog 子目录），但实际 WordPress 安装在 /blog 子目录。这会导致 WordPress 路由系统混乱。
+
+让我们进一步排查：
+
+深度排查.sh
+# 1. 查看 WordPress 是否安装在子目录，以及 siteurl/home 的设置
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_name, option_value FROM wp_options 
+WHERE option_name IN ('siteurl', 'home');
+"
+
+第 5 步最关键——用 ?p=639 直接通过 ID 访问产品，如果这个能返回 200，说明产品没问题，只是 rewrite rules 没生效。把所有结果贴给我。
+
+深度排查.sh
+L19
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_name, option_value FROM wp_options 
+> WHERE option_name IN ('siteurl', 'home');
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++-------------+--------------------------+
+| option_name | option_value             |
++-------------+--------------------------+
+| home        | http://topten-safety.com |
+| siteurl     | http://topten-safety.com |
++-------------+--------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# grep -E "WP_HOME|WP_SITEURL|table_prefix" /www/wwwroot/topten-safety.com/blog/wp-config.php
+$table_prefix = 'wp_';
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SHOW TABLES LIKE '%posts';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++-------------------------------------+
+| Tables_in_topten_safety_co (%posts) |
++-------------------------------------+
+| wp_posts                            |
++-------------------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -o /dev/null -w "%{http_code}" "https://topten-safety.com/wp-admin/options-permalink.php" -b "wordpress_logged_in_test=1"
+302root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php?post_type=product&p=639"
+HTTP/2 200 
+server: nginx
+date: Tue, 10 Feb 2026 09:14:53 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+link: <https://topten-safety.com/index.php/wp-json/wp/v2/product/639>; rel="alternate"; title="JSON"; type="application/json"
+link: <https://topten-safety.com/?p=639>; rel=shortlink
+strict-transport-security: max-age=31536000
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# 
+Copilot said: **产品通过 `?p=639` 返回 200！** 产品完全正常，问题100%是 WordPress 的
+产品通过 ?p=639 返回 200！ 产品完全正常，问题100%是 WordPress 的 rewrite rules 没有正确生成。
+
+注意看返回头里的链接：
+
+Code
+link: <https://topten-safety.com/index.php/wp-json/wp/v2/product/639>
+WordPress 知道这个产品存在。现在需要强制刷新 rewrite rules。
+
+最可靠的方式是通过 WP-CLI 或直接在 WordPress 后台操作：
+
+强制刷新rewrite.sh
+# 1. 检查是否有 WP-CLI
+which wp 2>/dev/null || find / -name "wp" -type f 2>/dev/null | head -3
+
+# 2. 如果有 WP-CLI，用它刷新 rewrite rules
+cd /www/wwwroot/topten-safety.com/blog
+wp rewrite flush --allow-root 2>/dev/null
+如果 WP-CLI 方式不行，还有一个最简单的方法：
+
+手动触发rewrite刷新.sh
+# 创建一个临时 PHP 文件，强制刷新 rewrite rules
+cat > /www/wwwroot/topten-safety.com/blog/flush-rewrite.php << 'EOF'
+<?php
+define('ABSPATH', dirname(__FILE__) . '/');
+require_once(ABSPATH . 'wp-load.php');
+flush_rewrite_rules(true);
+先试第一个脚本（WP-CLI），如果不行再试第二个（PHP 文件）。把结果贴给我。
+
+强制刷新rewrite.sh
+L14
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# which wp 2>/dev/null || find /
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# which wp 2>/dev/null || find / -name "wp" -type f 2>/dev/null | head -3
+/www/wwwroot/topten-safety.com/blog/wp-content/plugins/woocommerce/vendor/bin/wp
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com# cd /www/wwwroot/topten-safety.com/blog
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# wp rewrite flush --allow-root 2>/dev/null
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# wp rewrite flush --allow-root 2>/dev/null
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100 6975k  100 6975k    0     0  6262k      0  0:00:01  0:00:01 --:--:-- 6267k
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# chmod +x wp-cli.phar
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php wp-cli.phar rewrite flush --path=/www/wwwroot/topten-safety.com/blog --allow-root
+Warning: Rewrite rules are empty, possibly because of a missing permalink_structure option. Use 'wp rewrite list' to verify, or 'wp rewrite structure' to update permalink_structure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:16:51 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: 找到关键线索了！WP-CLI 说： ``` Warning: Rewrite rules are empty, possibly
+找到关键线索了！WP-CLI 说：
+
+Code
+Warning: Rewrite rules are empty, possibly because of a missing permalink_structure option.
+之前我们删除了 rewrite_rules，但 WP-CLI 说 permalink_structure 也有问题。让我们检查并修复：
+
+修复rewrite_rules.sh
+# 1. 确认 permalink_structure 是否还在
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_name, option_value FROM wp_options 
+WHERE option_name = 'permalink_structure';
+"
+
+把所有结果贴给我。第 3 步是关键——它会重新写入 permalink_structure 并强制 WordPress 重建所有路由规则，包括 WooCommerce 的产品路由。
+
+修复rewrite_rules.sh
+L20
+You said: 如果需要退出目录你得告诉我哦，下面是反馈的结果：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+如果需要退出目录你得告诉我哦，下面是反馈的结果：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_name, option_value FROM wp_options 
+> WHERE option_name = 'permalink_structure';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++---------------------+------------------------+
+| option_name         | option_value           |
++---------------------+------------------------+
+| permalink_structure | /index.php/%postname%/ |
++---------------------+------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php wp-cli.phar rewrite list --path=/www/wwwroot/topten-safety.com/blog --allow-root 2>&1 | head -20
+Warning: No rewrite rules.
+match   query   source
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php wp-cli.phar rewrite structure '/index.php/%postname%/' --path=/www/wwwroot/topten-safety.com/blog --allow-root
+Success: Rewrite structure set.
+Warning: Rewrite rules are empty, possibly because of a missing permalink_structure option. Use 'wp rewrite list' to verify, or 'wp rewrite structure' to update permalink_structure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php wp-cli.phar rewrite flush --hard --path=/www/wwwroot/topten-safety.com/blog --allow-root
+Warning: Regenerating a .htaccess file requires special configuration. See usage docs.
+Warning: Rewrite rules are empty, possibly because of a missing permalink_structure option. Use 'wp rewrite list' to verify, or 'wp rewrite structure' to update permalink_structure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php wp-cli.phar rewrite list --path=/www/wwwroot/topten-safety.com/blog --allow-root 2>&1 | grep -i "product"
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:18:08 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: Rewrite rules 始终为空！WP-CLI 反复说 `permalink_structure` 缺失，但数据库里明明有。这说明 WordPress
+Rewrite rules 始终为空！WP-CLI 反复说 permalink_structure 缺失，但数据库里明明有。这说明 WordPress 在 CLI 模式下可能无法正确加载。
+
+用 PHP 文件直接在 WordPress 内部执行：
+
+PHP强制刷新.sh
+# 创建临时 PHP 文件
+cat > /www/wwwroot/topten-safety.com/blog/flush-rewrite.php << 'PHPEOF'
+<?php
+require_once(dirname(__FILE__) . '/wp-load.php');
+
+// 强制刷新 rewrite rules
+把结果贴给我。这次是直接在 WordPress 内部执行 flush_rewrite_rules()，一定能生成 rewrite rules。
+
+PHP强制刷新.sh
+L32
+You said: 我不知道命令行有没有成功：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/flush-rewrite.php << 'PHPEOF' > <?php >
+我不知道命令行有没有成功：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/flush-rewrite.php << 'PHPEOF'
+> <?php
+> require_once(dirname(__FILE__) . '/wp-load.php');
+> 
+> // 强制刷新 rewrite rules
+> global $wp_rewrite;
+> $wp_rewrite->init();
+> flush_rewrite_rules(true);
+> 
+> echo "permalink_structure: " . get_option('permalink_structure') . "\n";
+> 
+> $rules = get_option('rewrite_rules');
+> echo "Total rules: " . (is_array($rules) ? count($rules) : 'EMPTY') . "\n";
+> 
+> if (is_array($rules)) {
+>     foreach ($rules as $pattern => $query) {
+>         if (stripos($pattern, 'product') !== false) {
+>             echo "PRODUCT RULE: $pattern => $query\n";
+>         }
+>     }
+> }
+> PHPEOF
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php /www/wwwroot/topten-safety.com/blog/flush-rewrite.php
+permalink_structure: /index.php/%postname%/
+Total rules: EMPTY
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# rm -f /www/wwwroot/topten-safety.com/blog/flush-rewrite.php
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:20:02 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: Rewrite rules 仍然是 `EMPTY`！这非常不正常。即使 `flush_rewrite_rules(true)` 执行了，rules 还是空的。 这说明
+Rewrite rules 仍然是 EMPTY！这非常不正常。即使 flush_rewrite_rules(true) 执行了，rules 还是空的。
+
+这说明 WordPress 的 permalink_structure 包含 /index.php/，而 WordPress 在这种情况下使用的是 PATHINFO 模式，不是 rewrite 模式。在 PATHINFO 模式下，WordPress 不需要 rewrite rules，它直接通过 PATH_INFO 解析 URL。这是正常的！
+
+所以真正的问题是：WordPress 通过 PATH_INFO 收到了 /product/l8700/，但无法解析出对应的产品。
+
+让我们直接调试 WordPress 内部到底收到了什么：
+
+调试WordPress内部.sh
+cat > /www/wwwroot/topten-safety.com/blog/debug-product.php << 'PHPEOF'
+<?php
+require_once(dirname(__FILE__) . '/wp-load.php');
+
+echo "=== SERVER VARS ===\n";
+echo "REQUEST_URI: " . $_SERVER['REQUEST_URI'] . "\n";
+把 PHP-CLI 执行的完整输出贴给我。我需要看到：
+
+WordPress 认为产品的 URL 是什么（Product URL）
+WooCommerce 的 permalink 设置
+WordPress 是否使用 PATHINFO 模式
+You said: 这串代码我不知道有没有成功：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/debug-product.php << 'PHPEOF' > <?php >
+这串代码我不知道有没有成功：root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/debug-product.php << 'PHPEOF'
+> <?php
+> require_once(dirname(__FILE__) . '/wp-load.php');
+> 
+> echo "=== SERVER VARS ===\n";
+> echo "REQUEST_URI: " . $_SERVER['REQUEST_URI'] . "\n";
+> echo "SCRIPT_NAME: " . $_SERVER['SCRIPT_NAME'] . "\n";
+> echo "PATH_INFO: " . (isset($_SERVER['PATH_INFO']) ? $_SERVER['PATH_INFO'] : 'NOT SET') . "\n";
+> echo "PHP_SELF: " . $_SERVER['PHP_SELF'] . "\n";
+> 
+> echo "\n=== WP QUERY ===\n";
+> global $wp, $wp_query;
+> $wp->parse_request();
+> echo "WP matched_rule: " . $wp->matched_rule . "\n";
+> echo "WP matched_query: " . $wp->matched_query . "\n";
+> echo "WP request: " . $wp->request . "\n";
+> 
+> echo "\n=== REWRITE ===\n";
+> global $wp_rewrite;
+> echo "Using PATHINFO: " . ($wp_rewrite->using_index_permalinks() ? 'YES' : 'NO') . "\n";
+> echo "Using mod_rewrite: " . ($wp_rewrite->using_mod_rewrite_permalinks() ? 'YES' : 'NO') . "\n";
+> echo "permalink_structure: " . $wp_rewrite->permalink_structure . "\n";
+> 
+> echo "\n=== WooCommerce ===\n";
+> $wc_permalinks = get_option('woocommerce_permalinks');
+> echo "WC permalinks: ";
+> print_r($wc_permalinks);
+> 
+> echo "\n=== TEST PRODUCT QUERY ===\n";
+> $test = new WP_Query(array('post_type' => 'product', 'name' => 'l8700'));
+> echo "Found posts: " . $test->found_posts . "\n";
+> if ($test->have_posts()) {
+>     $test->the_post();
+>     echo "Product title: " . get_the_title() . "\n";
+>     echo "Product URL: " . get_permalink() . "\n";
+> }
+> PHPEOF
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: 文件创建成功了。现在执行它： ```bash name=执行调试.sh # 用 PHP-CLI 直接执行 php /www/wwwroot/topten-safety.com/blog/debug-product.php ``` 把输出结果贴给我。
+文件创建成功了。现在执行它：
+
+执行调试.sh
+# 用 PHP-CLI 直接执行
+php /www/wwwroot/topten-safety.com/blog/debug-product.php
+
+把输出结果贴给我。
+
+调试WordPress内部.sh
+L40
+最新.txt
+You said: 我将回馈放到了文件“最新.txt”里
+我将回馈放到了文件“最新.txt”里
+Copilot said: 找到问题了！看这行： ``` Product URL: http://topten-safety.com/index.php//index.php/product/l8700/ ``` **双重 `/index.php/`！** 因为 `permalink_structure` 已经包含了
+找到问题了！看这行：
+
+Code
+Product URL: http://topten-safety.com/index.php//index.php/product/l8700/
+双重 /index.php/！ 因为 permalink_structure 已经包含了 /index.php/，而 woocommerce_permalinks 的 product_base 又设成了 /index.php/product，WordPress 拼接时就变成了 /index.php/ + /index.php/product/l8700/。
+
+解决方案：把 product_base 改回 /product（不带 /index.php），因为 WordPress 会自动加上 permalink_structure 里的 /index.php/ 前缀。
+
+终极修复.sh
+# 1. 把 product_base 改回 /product（不带 index.php）
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+UPDATE wp_options 
+SET option_value = 'a:5:{s:12:\"product_base\";s:8:\"/product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+WHERE option_name = 'woocommerce_permalinks';
+"
+把所有结果贴给我。这次产品 URL 应该变成 http://topten-safety.com/index.php/product/l8700/（只有一个 /index.php/）。
+
+终极修复.sh
+L2-L6
+You said: oot@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+oot@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> UPDATE wp_options 
+> SET option_value = 'a:5:{s:12:\"product_base\";s:8:\"/product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+> WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
+着是不是报错了，如果是，我可以手动调整
+Copilot said: 不是报错，那只是一个警告（Warning），意思是"在命令行里明文写密码不安全"。**命令本身已经执行成功了。** 继续执行剩下的步骤： ```bash name=继续执行.sh # 1. 确认修改成功 mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb'
+不是报错，那只是一个警告（Warning），意思是"在命令行里明文写密码不安全"。命令本身已经执行成功了。
+
+继续执行剩下的步骤：
+
+继续执行.sh
+# 1. 确认修改成功
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+SELECT option_value FROM wp_options WHERE option_name = 'woocommerce_permalinks';
+"
+
+# 2. 用 PHP 刷新 rewrite 并验证产品 URL
+把结果贴给我。
+
+终极修复.sh
+L29
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> SELECT option_value FROM wp_options WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| option_value                                                                                                                                                                   |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| a:5:{s:12:"product_base";s:8:"/product";s:13:"category_base";s:8:"products";s:8:"tag_base";s:11:"product-tag";s:14:"attribute_base";s:0:"";s:22:"use_verbose_page_rules";b:0;} |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/check-url.php << 'PHPEOF'
+> <?php
+> require_once(dirname(__FILE__) . '/wp-load.php');
+> flush_rewrite_rules(true);
+> $product = get_page_by_path('l8700', OBJECT, 'product');
+> if ($product) {
+>     echo "Product URL: " . get_permalink($product->ID) . "\n";
+> } else {
+>     echo "Product not found\n";
+> }
+> PHPEOF
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php /www/wwwroot/topten-safety.com/blog/check-url.php
+
+Product URL: http://topten-safety.com/index.php//product/l8700/
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# rm -f /www/wwwroot/topten-safety.com/blog/check-url.php
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+HTTP/2 404 
+server: nginx
+date: Tue, 10 Feb 2026 09:36:14 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+link: <https://topten-safety.com/index.php/wp-json/>; rel="https://api.w.org/"
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: 看到了！URL 变成了： ``` http://topten-safety.com/index.php//product/l8700/ ``` 注意 `/index.php/` 和 `/product` 之间有**双斜杠 `//`**。这说明
+看到了！URL 变成了：
+
+Code
+http://topten-safety.com/index.php//product/l8700/
+注意 /index.php/ 和 /product 之间有双斜杠 //。这说明 WordPress 在拼接时，/index.php/ 结尾已经有一个 /，而 product_base 的值 /product 开头又有一个 /。
+
+解决方案：把 product_base 设为 product（不带前面的 /）。
+
+去掉斜杠.sh
+# 1. 把 product_base 从 /product 改成 product（去掉前面的斜杠）
+mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+UPDATE wp_options 
+SET option_value = 'a:5:{s:12:\"product_base\";s:7:\"product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+WHERE option_name = 'woocommerce_permalinks';
+"
+把结果贴给我。这次 URL 应该变成 http://topten-safety.com/index.php/product/l8700/（单斜杠）。
+
+去掉斜杠.sh
+L9-L21
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# mysql -u topten_safety_co -p'ewd7zt4xszHfcfPb' topten_safety_co -e "
+> UPDATE wp_options 
+> SET option_value = 'a:5:{s:12:\"product_base\";s:7:\"product\";s:13:\"category_base\";s:8:\"products\";s:8:\"tag_base\";s:11:\"product-tag\";s:14:\"attribute_base\";s:0:\"\";s:22:\"use_verbose_page_rules\";b:0;}'
+> WHERE option_name = 'woocommerce_permalinks';
+> "
+mysql: [Warning] Using a password on the command line interface can be insecure.
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat > /www/wwwroot/topten-safety.com/blog/check-url.php << 'PHPEOF'
+> <?php
+> require_once(dirname(__FILE__) . '/wp-load.php');
+> flush_rewrite_rules(true);
+> $product = get_page_by_path('l8700', OBJECT, 'product');
+> if ($product) {
+>     echo "Product URL: " . get_permalink($product->ID) . "\n";
+> } else {
+>     echo "Product not found\n";
+> }
+> PHPEOF
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# php /www/wwwroot/topten-safety.com/blog/check-url.php
+
+Product URL: http://topten-safety.com/index.php/product/l8700/
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# rm -f /www/wwwroot/topten-safety.com/blog/check-url.php
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: **URL 正确了！** `http://topten-safety.com/index.php/product/l8700/` —— 单斜杠，完美！ 现在测试访问： ```bash name=最终测试.sh # 1.
+URL 正确了！ http://topten-safety.com/index.php/product/l8700/ —— 单斜杠，完美！
+
+现在测试访问：
+
+最终测试.sh
+v2
+# 1. 测试 /index.php/product/l8700/（WordPress 内部路径）
+curl -sS -D - -o /dev/null "https://topten-safety.com/index.php/product/l8700/"
+
+# 2. 测试 /product/l8700/（Nginx 重写后的路径）
+curl -sS -D - -o /dev/null "https://topten-safety.com/product/l8700/"
+
+把两个结果都贴给我！
+
+You said: 完成了，现在帮我整理文档，让以后网站部署不会在出现相同的问题。一下手册也有错，都修改掉，顺序问题等等，# TOPTEN 官网部署文档 ## 项目架构 ``` 域名 (例: example.com) ├── Next.js
+完成了，现在帮我整理文档，让以后网站部署不会在出现相同的问题。一下手册也有错，都修改掉，顺序问题等等，# TOPTEN 官网部署文档
+## 项目架构
+```
+域名 (例: example.com)
+├── Next.js 前端主页 → 运行在 localhost:3000，通过 Nginx 反向代理
+├── WordPress 后台   → 放在 /blog 目录，通过 PHP-FPM 处理
+└── data/config.json → Next.js 运行时需要的配置文件
+```
+路由规则：
+• / → Next.js（主页、3D 动画等）
+• /wp-admin/、/wp-login.php、/index.php/* → WordPress
+• /wp-content/、/wp-includes/ → WordPress 静态资源
+• /products、/applications、/about、/news、/contact → WordPress 页面
+---
+## 一、环境要求
+| 组件 | 版本 | 说明 |
+| --- | --- | --- |
+| 操作系统 | CentOS / Ubuntu / Debian | Linux 服务器 |
+| 宝塔面板 | 最新版 | 服务器管理面板 |
+| Nginx | 1.24+ | 宝塔自带安装 |
+| Node.js | v22.x | 通过宝塔 Node.js 版本管理器安装 |
+| PHP | 8.0+ | 宝塔自带安装 |
+| MySQL | 5.7+ / 8.0 | WordPress 数据库 |
+| PM2 | 最新版 | Node.js 进程管理 |
+---
+## 二、安装依赖
+### 2.1 宝塔面板安装软件
+在宝塔 → 软件商店中安装：
+• Nginx
+• PHP 8.0（或更高版本）
+• MySQL 5.7 / 8.0
+• PM2管理器（或手动安装）
+• Node.js 版本管理器
+### 2.2 安装 Node.js v22
+```bash
+# 通过宝塔 Node.js 版本管理器安装 v22
+# 或者手动安装：
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
+
+# 验证
+node -v
+npm -v
+```
+### 2.3 安装 PM2
+```bash
+npm install -g pm2
+
+# 验证
+pm2 -v
+```
+---
+## 三、创建网站
+### 3.1 宝塔创建站点
+1. 打开 宝塔 → 网站 → 添加站点
+2. 填写域名（例：example.com）
+3. 选择 PHP 版本：纯静态（先不选 PHP）
+4. 创建数据库（用于 WordPress）
+5. 记住数据库名、用户名、密码
+> ⚠️ 以下文档中，请将 你的域名 替换为你的实际域名，你的网站目录 替换为实际路径
+> 例如：域名 = topten-tech.com，网站目录 = /www/wwwroot/topten-tech.com
+---
+## 四、部署 Next.js 前端
+### 4.1 上传项目文件
+将 Next.js 项目文件上传到网站根目录，目录结构应为：
+```
+/www/wwwroot/你的网站目录/
+├── app/                  # Next.js 应用目录
+├── public/               # 静态资源
+├── package.json
+├── next.config.ts
+├── tailwind.config.ts
+├── postcss.config.mjs
+├── tsconfig.json
+└── eslint.config.mjs
+```
+### 4.2 安装依赖并构建
+```bash
+# 进入项目目录
+cd /www/wwwroot/你的网站目录
+
+# 安装依赖
+npm install
+
+# 构建项目
+npm run build
+```
+### 4.3 创建 data/config.json（⚠️ 关键步骤，不可遗漏）
+```bash
+# 创建 data 目录
+mkdir -p /www/wwwroot/你的网站目录/data
+
+# 创建 config.json
+echo '{"fonts": []}' > /www/wwwroot/你的网站目录/data/config.json
+
+# 设置权限
+chmod 755 /www/wwwroot/你的网站目录/data
+chmod 644 /www/wwwroot/你的网站目录/data/config.json
+chown -R www:www /www/wwwroot/你的网站目录/data
+```
+> ⚠️ 踩坑警告：如果缺少这个文件，Next.js 启动后会报 ENOENT 错误，页面无法正常加载！
+### 4.4 使用 PM2 启动 Next.js
+```bash
+cd /www/wwwroot/你的网站目录
+
+# 启动
+pm2 start npm --name "你的站点名称" -- start
+
+# 保存 PM2 进程列表（开机自启）
+pm2 save
+pm2 startup
+
+# 验证
+pm2 list
+pm2 logs 你的站点名称
+```
+启动成功后应该看到：
+```
+✓ Ready in xxxms
+Local: http://localhost:3000
+```
+### 4.5 验证 Next.js 运行
+```bash
+curl http://127.0.0.1:3000
+```
+应该返回 HTML 内容。
+---
+## 五、部署 WordPress
+### 5.1 下载 WordPress
+```bash
+cd /www/wwwroot/你的网站目录
+
+# 下载 WordPress
+wget https://wordpress.org/latest.tar.gz
+
+# 解压
+tar -xzf latest.tar.gz
+
+# 重命名为 blog
+mv wordpress blog
+
+# 删除压缩包
+rm latest.tar.gz
+
+# 设置权限
+chown -R www:www blog
+chmod -R 755 blog
+```
+### 5.2 配置 WordPress
+```bash
+cd /www/wwwroot/你的网站目录/blog
+
+# 复制配置模板
+cp wp-config-sample.php wp-config.php
+```
+编辑 wp-config.php，修改数据库信息：
+```php
+define('DB_NAME', '你的数据库名');
+define('DB_USER', '你的数据库用户名');
+define('DB_PASSWORD', '你的数据库密码');
+define('DB_HOST', 'localhost');
+```
+---
+## 六、配置 Nginx（⚠️ 最关键步骤）
+### 6.1 添加反向代理
+1. 打开 宝塔 → 网站 → 你的域名 → 设置 → 反向代理
+2. 点击 添加反向代理
+3. 填写：
+  • 代理名称：随意（如 nextjs）
+  • 目标URL：http://127.0.0.1:3000
+  • 发送域名：$host
+4. 保存
+> ⚠️ 踩坑警告：「发送域名」必须是 $host，不能是 127.0.0.1！否则 Next.js 的 CSS/JS 文件无法加载，页面会没有样式！
+### 6.2 修改反向代理配置文件
+1. 开 宝塔 → 文件
+2. 进入 /www/server/panel/vhost/nginx/proxy/你的域名/
+3. 打开里面的 .conf 文件（文件名类似 xxxxxxx_你的域名.conf）
+4. 全选删除，粘贴以下内容：
+```nginx
+#PROXY-START/
+
+# ==================== WordPress 路由规则 ====================
+
+# WordPress 登录页
+location = /wp-login.php {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+# WordPress 前台页面（固定链接格式：/index.php/页面名/）
+location ^~ /index.php {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root/index.php;
+    include fastcgi_params;
+}
+
+# WordPress 后台
+location ^~ /wp-admin/ {
+    root /www/wwwroot/你的网站目录/blog;
+    index index.php;
+    try_files $uri $uri/ /wp-admin/index.php?$args;
+    location ~ \.php$ {
+        fastcgi_pass unix:/tmp/php-cgi-80.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
+
+# WordPress 上传的媒体文件、主题、插件等
+location ^~ /wp-content/ {
+    root /www/wwwroot/你的网站目录/blog;
+    expires 30d;
+}
+
+# WordPress 核心 JS/CSS 文件
+location ^~ /wp-includes/ {
+    root /www/wwwroot/你的网站目录/blog;
+    expires 30d;
+}
+
+# WordPress REST API
+location ^~ /wp-json/ {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME /www/wwwroot/你的网站目录/blog/index.php;
+    include fastcgi_params;
+}
+
+# WordPress XML-RPC
+location = /xmlrpc.php {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+# WordPress 自定义页面路由（根据你的 WP 页面调整）
+location ~ ^/(products|applications|about|news|contact)(/.*)? {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME /www/wwwroot/你的网站目录/blog/index.php;
+    include fastcgi_params;
+}
+
+# ==================== Next.js 反向代理（兜底规则） ====================
+
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header REMOTE-HOST $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_http_version 1.1;
+    add_header X-Cache $upstream_cache_status;
+    if ( $uri ~* "\.(gif|png|jpg|css|js|woff|woff2)$" ) {
+        expires 1m;
+    }
+}
+
+#PROXY-END/
+```
+1. 点击 保存
+> ⚠️ 踩坑警告：
+> • fastcgi_pass unix:/tmp/php-cgi-80.sock; 中的 80 对应 PHP 8.0 版本。如果你用的是 PHP 8.1 则改为 81，PHP 8.2 改为 82，以此类推。
+> • 可以通过 ls /tmp/php-cgi-*.sock 查看实际的 sock 文件名。
+> • WordPress 配置必须放在 Next.js 的 location / 前面，否则所有请求都会被 Next.js 拦截。
+> • 不要在主配置文件（网站设置 → 配置文件）中重复添加 WordPress 的 location 规则，否则会报 duplicate location 错误。
+### 6.3 验证并重载 Nginx
+```bash
+# 检查配置语法
+nginx -t
+
+# 重载（不要用 restart）
+nginx -s reload
+```
+### 6.4 配置 SSL 证书
+在 宝塔 → 网站 → 你的域名 → 设置 → SSL 中申请或上传证书。
+---
+## 七、验证清单
+部署完成后，逐一检查以下页面：
+| 测试项 | URL | 预期结果 |
+| --- | --- | --- |
+| Next.js 主页 | https://你的域名/ | 显示带样式的 3D 动画主页 |
+| Next.js 样式 | 主页应有完整 CSS | 不是纯文本/蓝色链接 |
+| WP 登录页 | https://你的域名/wp-login.php | WordPress 登录表单 |
+| WP 后台 | https://你的域名/wp-admin/ | WordPress 仪表盘 |
+| WP 前台页面 | https://你的域名/index.php/页面名 | WordPress 页面内容 |
+| WP 页面路由 | https://你的域名/products | WordPress 产品页 |
+---
+## 八、常见问题与解决方案
+### ❌ 问题1：Next.js 启动报 ENOENT 错误
+```
+Error: ENOENT: no such file or directory, open '.../data/config.json'
+```
+原因： 缺少 data/config.json 文件
+解决：
+```bash
+mkdir -p /www/wwwroot/你的网站目录/data
+echo '{"fonts": []}' > /www/wwwroot/你的网站目录/data/config.json
+chown -R www:www /www/wwwroot/你的网站目录/data
+pm2 restart 你的站点名称
+```
+---
+### ❌ 问题2：主页打开但没有样式（纯文本+蓝色链接）
+原因： Nginx 反向代理的 Host 头设置为 127.0.0.1，导致 Next.js 的 /_next/static/ 请求失败
+解决： 确保反向代理配置中是：
+```nginx
+proxy_set_header Host $host;    # ✅ 正确
+# proxy_set_header Host 127.0.0.1;  # ❌ 错误
+```
+---
+### ❌ 问题3：主页 403 Forbidden
+原因： 反向代理配置文件被删除或移动了
+解决： 确保 /www/server/panel/vhost/nginx/proxy/你的域名/ 目录下有 .conf 文件，且内容正确。
+---
+### ❌ 问题4：wp-admin 显示 Next.js 的 404 页面
+原因： Nginx 的 location ^~ /（反向代理）优先级高于 location /wp-admin/，导致请求被 Next.js 拦截
+解决： WordPress 的 location 规则必须用 ^~ 前缀，并且放在代理配置文件中（不是主配置文件），与 Next.js 的 location / 同级。
+---
+### ❌ 问题5：wp-admin 报 "Primary script unknown"
+原因： 使用 alias 方式时，SCRIPT_FILENAME 路径拼接错误，PHP-FPM 找不到文件
+解决： 不要使用 alias，改用 root 方式：
+```nginx
+# ✅ 正确
+location ^~ /wp-admin/ {
+    root /www/wwwroot/你的网站目录/blog;
+    ...
+}
+
+# ❌ 错误
+location ^~ /wp-admin/ {
+    alias /www/wwwroot/你的网站目录/blog/wp-admin/;
+    ...
+}
+```
+---
+### ❌ 问题6：WordPress 前台页面 404
+原因： WordPress 使用 /index.php/页面名 格式的固定链接，但这个路径被 Next.js 拦截了
+解决： 在代理配置中添加：
+```nginx
+location ^~ /index.php {
+    root /www/wwwroot/你的网站目录/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root/index.php;
+    include fastcgi_params;
+}
+```
+---
+### ❌ 问题7：Nginx 报 duplicate location 错误
+原因： 在主配置文件和代理配置文件中同时定义了相同的 location 块
+解决： WordPress 的 location 规则只放在代理配置文件中，不要放在主配置文件（网站设置 → 配置文件）中。
+---
+## 九、常用运维命令
+```bash
+# ===== Next.js =====
+pm2 list                        # 查看进程列表
+pm2 logs 你的站点名称             # 查看日志
+pm2 restart 你的站点名称          # 重启
+pm2 stop 你的站点名称             # 停止
+pm2 delete 你的站点名称           # 删除
+
+# 重新构建并部署
+cd /www/wwwroot/你的网站目录
+npm run build
+pm2 restart 你的站点名称
+
+# ===== Nginx =====
+nginx -t                        # 检查配置语法
+nginx -s reload                 # 重载配置
+nginx -T 2>&1 | grep "wp-admin" # 检查 WP 配置是否加载
+
+# ===== 查看日志 =====
+tail -20 /www/wwwlogs/你的域名.error.log     # Nginx 错误日志
+pm2 logs 你的站点名称 --lines 50              # Next.js 日志
+
+# ===== 查看 PHP sock 文件 =====
+ls /tmp/php-cgi-*.sock          # 确认 PHP-FPM 的 sock 文件名
+```
+---
+## 十、部署前检查清单
+在正式服务器操作前，逐项确认：
+[ ] 宝塔已安装 Nginx、PHP、MySQL、Node.js v22
+[ ] PM2 已全局安装
+[ ] 网站已在宝塔中创建，数据库已创建
+[ ] Next.js 项目已上传并 npm install + npm run build
+[ ] data/config.json 文件已创建，内容为 {"fonts": []}
+[ ] PM2 已启动 Next.js，curl http://127.0.0.1:3000 有响应
+[ ] WordPress 已下载解压到 blog/ 目录
+[ ] wp-config.php 数据库信息已配置
+[ ] 宝塔反向代理已添加，目标 http://127.0.0.1:3000
+[ ] 代理配置文件已替换为包含 WordPress 路由的完整配置
+[ ] proxy_set_header Host 是 $host 不是 127.0.0.1
+[ ] nginx -t 通过，nginx -s reload 成功
+[ ] SSL 证书已配置
+[ ] 所有验证页面测试通过
+Copilot said: 好的，我来帮你整理一份完整、正确的部署文档，把我们这次踩过的所有坑都纳入进去。 ````markdown name=TOPTEN官网部署手册.md # TOPTEN 官网部署手册 --- ## 项目架构 ``` 域名 (例: example.com) ├──
+好的，我来帮你整理一份完整、正确的部署文档，把我们这次踩过的所有坑都纳入进去。
+
+TOPTEN官网部署手册.md
+# TOPTEN 官网部署手册
+
+---
+
+## 项目架构
+
+这份文档包含了我们这次调试过程中遇到的所有坑，特别是：
+
+WooCommerce product_base 不能带 /index.php（否则产生双重路径）
+error_page 404 必须注释掉（否则 WordPress 的 404 会被转给 Next.js）
+/product/ 需要 rewrite 到 /index.php/product/（而不是直接 fastcgi 处理）
+WordPress PATHINFO 模式下 rewrite_rules 为空是正常的
+部署顺序：先 WordPress 再 Next.js
+You said: https://topten-safety.com/wp-admin/显示File not found.
+https://topten-safety.com/wp-admin/显示File not found.
+planning response
+
+Copilot said: 让我通过另一个方式来排查： ```bash name=排查wp-admin问题.sh # 1. 查看反向代理配置文件是否存在 ls -la /www/server/panel/vhost/nginx/proxy/topten-safety.com/ # 2.
+让我通过另一个方式来排查：
+
+排查wp-admin问题.sh
+# 1. 查看反向代理配置文件是否存在
+ls -la /www/server/panel/vhost/nginx/proxy/topten-safety.com/
+
+# 2. 查看反向代理配置文件的内容
+cat /www/server/panel/vhost/nginx/proxy/topten-safety.com/*.conf
+
+请执行这些命令，把所有输出都贴给我。这样我们可以：
+
+确认反向代理配置文件是否存在且内容是否正确
+确认主配置文件是否正确引用了反向代理配置
+确认 WordPress 的 wp-admin/index.php 文件是否存在且可访问
+排查wp-admin问题.sh
+L20
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# ls -la /www/server/panel/vhost/nginx/proxy/topten-safety.com/ total 12 drw------- 2 root
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# ls -la /www/server/panel/vhost/nginx/proxy/topten-safety.com/
+total 12
+drw------- 2 root root 4096 Feb 10 16:27 .
+drw------- 3 root root 4096 Feb 10 12:43 ..
+-rw------- 1 root root 1969 Feb 10 17:11 7b072079e9ca0cc2a413dbe40fef68bb_topten-safety.com.conf
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# cat /www/server/panel/vhost/nginx/proxy/topten-safety.com/*.conf
+#PROXY-START/
+
+# ==================== 1. WordPress 核心 ====================
+location ~ ^/(wp-admin|wp-login\.php|wp-json|xmlrpc\.php) {
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+location ~ ^/(wp-content|wp-includes) {
+    root /www/wwwroot/topten-safety.com/blog;
+    expires 30d;
+}
+
+# ==================== 2. 文章页 (index.php) ====================
+location ^~ /index.php {
+    root /www/wwwroot/topten-safety.com/blog;
+    fastcgi_pass unix:/tmp/php-cgi-80.sock;
+    fastcgi_split_path_info ^(.+\.php)(/.+)$;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_param PATH_INFO $fastcgi_path_info;
+    include fastcgi_params;
+}
+
+# ==================== 3. WooCommerce 产品页修复 ====================
+# 把 /product/xxx/ 重写到 /index.php/product/xxx/，交给上面的 index.php 块处理
+location ^~ /product/ {
+    rewrite ^ /index.php$request_uri last;
+}
+
+# ==================== 4. WooCommerce 其他页面 ====================
+# 需要哪个就取消注释哪个
+
+# location ^~ /cart/ {
+#     rewrite ^ /index.php$request_uri last;
+# }
+
+# location ^~ /checkout/ {
+#     rewrite ^ /index.php$request_uri last;
+# }
+
+# location ^~ /my-account/ {
+#     rewrite ^ /index.php$request_uri last;
+# }
+
+# ==================== 5. Next.js 兜底 ====================
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header REMOTE-HOST $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_http_version 1.1;
+
+    if ( $uri ~* "\.(gif|png|jpg|css|js|woff|woff2)$" ) {
+        expires 1m;
+    }
+}
+
+#PROXY-END/root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# grep -A 5 "proxy" /www/server/panel/vhost/nginx/topten-safety.com.conf
+        proxy_cache_purge cache_one $host$1$is_args$args;
+    }
+
+    # 引用反向代理文件
+    include /www/server/panel/vhost/nginx/proxy/topten-safety.com/*.conf;
+
+    include enable-php-00.conf;
+    #PHP-INFO-END
+
+    #REWRITE-START URL重写规则引用
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# nginx -t
+nginx: the configuration file /www/server/nginx/conf/nginx.conf syntax is ok
+nginx: configuration file /www/server/nginx/conf/nginx.conf test is successful
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# tail -20 /www/wwwlogs/topten-safety.com.error.log
+2026/02/10 17:51:44 [error] 314871#0: *2147 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/l10n.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:51:44 [error] 314871#0: *2147 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/login.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/login.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:51:44 [error] 314871#0: *2147 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/password-strength-meter.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/password-strength-meter.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:51:44 [error] 314871#0: *2147 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/user-profile.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/user-profile.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:53:19 [error] 314871#0: *2156 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/forms.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/forms.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:53:19 [error] 314871#0: *2156 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/l10n.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:53:19 [error] 314871#0: *2156 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/login.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/login.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:53:19 [error] 314871#0: *2156 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/user-profile.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/user-profile.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:53:19 [error] 314871#0: *2156 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/password-strength-meter.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/password-strength-meter.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:25 [error] 314871#0: *2166 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/forms.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/forms.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:25 [error] 314871#0: *2166 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/login.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/login.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:25 [error] 314871#0: *2166 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/password-strength-meter.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/password-strength-meter.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:25 [error] 314871#0: *2166 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/css/l10n.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:25 [error] 314871#0: *2166 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/user-profile.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 43.255.191.169, server: topten-safety.com, request: "GET /wp-admin/js/user-profile.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:46 [error] 314871#0: *2175 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/forms.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/css/forms.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:46 [error] 314871#0: *2175 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/css/l10n.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:46 [error] 314871#0: *2175 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/login.min.css' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/css/login.min.css?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:46 [error] 314871#0: *2175 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/password-strength-meter.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/password-strength-meter.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:55:46 [error] 314871#0: *2175 FastCGI sent in stderr: "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/js/user-profile.min.js' has been denied (see security.limit_extensions)" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/js/user-profile.min.js?ver=6.9.1 HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/wp-login.php"
+2026/02/10 17:58:17 [error] 314871#0: *2182 FastCGI sent in stderr: "Primary script unknown" while reading response header from upstream, client: 172.96.141.37, server: topten-safety.com, request: "GET /wp-admin/ HTTP/2.0", upstream: "fastcgi://unix:/tmp/php-cgi-80.sock:", host: "topten-safety.com", referrer: "https://topten-safety.com/index.php/wp-admin"
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# ls -la /www/wwwroot/topten-safety.com/blog/wp-admin/ | head -10
+total 1164
+drwxr-xr-x 9 www www  4096 Feb  3 17:29 .
+drwxr-xr-x 8 www www  4096 Feb 10 17:37 ..
+-rwxr-xr-x 1 www www 16461 Feb  3 17:29 about.php
+-rwxr-xr-x 1 www www  5146 Jul  4  2024 admin-ajax.php
+-rwxr-xr-x 1 www www  2834 Sep 26  2024 admin-footer.php
+-rwxr-xr-x 1 www www   479 Feb  5 17:37 admin-functions.php
+-rwxr-xr-x 1 www www  9336 Jan 24  2025 admin-header.php
+-rwxr-xr-x 1 www www 12646 Oct 11 23:41 admin.php
+-rwxr-xr-x 1 www www  2021 Jan 16  2025 admin-post.php
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# stat /www/wwwroot/topten-safety.com/blog/wp-admin/index.php
+  File: /www/wwwroot/topten-safety.com/blog/wp-admin/index.php
+  Size: 7864            Blocks: 16         IO Block: 4096   regular file
+Device: 8,1     Inode: 397379      Links: 1
+Access: (0755/-rwxr-xr-x)  Uid: ( 1000/     www)   Gid: ( 1000/     www)
+Access: 2026-02-09 17:54:27.719137074 +0800
+Modify: 2023-09-14 00:54:20.000000000 +0800
+Change: 2026-02-05 12:14:16.122336777 +0800
+ Birth: 2026-02-05 12:14:15.970331263 +0800
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: 找到问题了！看错误日志： ``` "Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been
+找到问题了！看错误日志：
+
+Code
+"Access to the script '/www/wwwroot/topten-safety.com/blog/wp-admin/css/l10n.min.css' has been denied (see security.limit_extensions)"
+问题：你的反向代理配置中，location ~ ^/(wp-admin|wp-login\.php|wp-json|xmlrpc\.php) 这个正则块在处理所有匹配的请求时，都直接发送给 PHP-FPM。但 CSS、JS 文件不应该走 PHP，它们应该直接由 Nginx 提供。
+
+根本原因：反向代理配置里，wp-admin 的 CSS 和 JS 文件被当作 PHP 脚本来处理了。
+
+修改反向代理配置文件，替换为：
+
+修复wp-admin.sh
+cat > /www/server/panel/vhost/nginx/proxy/topten-safety.com/7b072079e9ca0cc2a413dbe40fef68bb_topten-safety.com.conf << 'EOF'
+#PROXY-START/
+
+# ==================== 1. WordPress 静态资源（优先级最高） ====================
+location ^~ /wp-content/ {
+    root /www/wwwroot/topten-safety.com/blog;
+执行这个脚本，把结果贴给我。关键改动：
+
+静态资源单独处理：/wp-admin/css/、/wp-admin/js/ 等直接由 Nginx 提供，不走 PHP-FPM
+wp-admin 使用 try_files：让 Nginx 尝试访问真实文件，只有 PHP 才发送给 FPM
+顺序调整：静态资源规则放在最前面，优先级最高
+修复wp-admin.sh
+L120
+You said: root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# nginx -t nginx: the configuration file /www/server/nginx/conf/nginx.conf
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# nginx -t
+nginx: the configuration file /www/server/nginx/conf/nginx.conf syntax is ok
+nginx: configuration file /www/server/nginx/conf/nginx.conf test is successful
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# nginx -s reload
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# curl -sS -D - -o /dev/null "https://topten-safety.com/wp-admin/"
+HTTP/2 302 
+server: nginx
+date: Tue, 10 Feb 2026 10:05:48 GMT
+content-type: text/html; charset=UTF-8
+location: https://topten-safety.com/wp-login.php?redirect_to=https%3A%2F%2Ftopten-safety.com%2Fwp-admin%2F&reauth=1
+expires: Wed, 11 Jan 1984 05:00:00 GMT
+cache-control: no-cache, must-revalidate, max-age=0, no-store, private
+x-redirect-by: WordPress
+strict-transport-security: max-age=31536000
+
+root@RainYun-Pk29QOeL:/www/wwwroot/topten-safety.com/blog# 
+Copilot said: **完美！** 返回 `HTTP/2 302` 并且正确重定向到登录页！ 这说明 wp-admin 现在工作正常了。测试登录页： ```bash
+完美！ 返回 HTTP/2 302 并且正确重定向到登录页！
+
+这说明 wp-admin 现在工作正常了。测试登录页：
+
+测试登录页.sh
+# 测试登录页
+curl -sS -D - "https://topten-safety.com/wp-login.php" | head -50
+
+把结果贴给我，确认登录页面能正常加载（应该包含 HTML 内容和 CSS/JS 的请求）。
+
+然后我们验证整个网站是否都正常：
+
+完整验证.sh
+# 1. 测试 Next.js 主页
+echo "=== Next.js 主页 ==="
+curl -sS -D - -o /dev/null "https://topten-safety.com/"
+
+# 2. 测试 WordPress 登录页
+echo -e "\n=== WP 登录页 ==="
+执行这个完整验证脚本，把所有结果贴给我。如果都是 200 或 302（正确的重定向），那就全部完成了！
